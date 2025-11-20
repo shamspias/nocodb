@@ -31,7 +31,7 @@ CONFIG_REDIS_ENABLED=""
 CONFIG_MINIO_ENABLED=""
 CONFIG_MINIO_DOMAIN_NAME=""
 CONFIG_MINIO_SSL_ENABLED=""
-CONFIG_WATCHTOWER_ENABLED=""
+CONFIG_DIUN_ENABLED=""
 CONFIG_NUM_INSTANCES=""
 CONFIG_POSTGRES_PASSWORD=""
 CONFIG_REDIS_PASSWORD=""
@@ -783,7 +783,7 @@ get_advanced_options() {
 	fi
 
 	CONFIG_REDIS_ENABLED=$(prompt_oneof "Do you want to enable Redis for caching?" "Y" "N")
-	CONFIG_WATCHTOWER_ENABLED=$(prompt_oneof "Do you want to enable Watchtower for automatic updates?" "Y" "N")
+	CONFIG_DIUN_ENABLED=$(prompt_oneof "Do you want to enable DIUN for container update monitoring?" "Y" "N")
 
 	NUM_CORES=$(get_nproc)
 	CONFIG_NUM_INSTANCES=$(read_number_range "How many instances of NocoDB do you want to run?" 1 "$NUM_CORES" 1)
@@ -793,7 +793,7 @@ set_default_options() {
 	CONFIG_EDITION="CE"
 	CONFIG_POSTGRES_SQLITE="P"
 	CONFIG_REDIS_ENABLED="Y"
-	CONFIG_WATCHTOWER_ENABLED="Y"
+	CONFIG_DIUN_ENABLED="Y"
 	CONFIG_NUM_INSTANCES=1
 }
 
@@ -849,7 +849,7 @@ EOF
     volumes:
       - ./nocodb:/usr/app/data
     labels:
-      - "com.centurylinklabs.watchtower.enable=true"
+      - "diun.enable=true"
       - "traefik.enable=true"
       - "traefik.http.routers.nocodb.rule=Host(\`${CONFIG_DOMAIN_NAME}\`)"
 EOF
@@ -899,7 +899,7 @@ EOF
     volumes:
       - ./nocodb:/usr/app/data
     labels:
-      - "com.centurylinklabs.watchtower.enable=true"
+      - "diun.enable=true"
 EOF
 	fi
 
@@ -988,7 +988,7 @@ EOF
 	if [ "${CONFIG_MINIO_ENABLED}" = "Y" ]; then
 		cat >>"$compose_file" <<EOF
   minio:
-    image: minio/minio:RELEASE.2025-05-24T17-08-30Z-cpuv1
+    image: minio/minio:RELEASE.2025-01-02T15-31-46Z
     restart: unless-stopped
     env_file: docker.env
     entrypoint: /bin/sh
@@ -1025,13 +1025,25 @@ EOF
 
 EOF
 	fi
-	if [ "${CONFIG_WATCHTOWER_ENABLED}" = "Y" ]; then
+	if [ "${CONFIG_DIUN_ENABLED}" = "Y" ]; then
 		cat >>"$compose_file" <<EOF
-  watchtower:
-    image: containrrr/watchtower
+  diun:
+    image: crazymax/diun:latest
+    container_name: diun
+    command: serve
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    command: --schedule "0 2 * * 6" --cleanup
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "./diun-data:/data"
+      - "./diun-config.yml:/diun.yml:ro"
+    environment:
+      - "TZ=UTC"
+      - "LOG_LEVEL=info"
+      - "LOG_JSON=false"
+      - "DIUN_WATCH_WORKERS=10"
+      - "DIUN_WATCH_SCHEDULE=0 2 * * *"
+      - "DIUN_WATCH_JITTER=30s"
+      - "DIUN_PROVIDERS_DOCKER=true"
+      - "DIUN_PROVIDERS_DOCKER_WATCHBYDEFAULT=false"
     restart: unless-stopped
     networks:
       - nocodb-network
@@ -1051,6 +1063,60 @@ networks:
   nocodb-network:
     driver: bridge
 EOF
+}
+
+create_diun_config() {
+	if [ "${CONFIG_DIUN_ENABLED}" != "Y" ]; then
+		return
+	fi
+
+	cat >./diun-config.yml <<EOF
+# DIUN configuration file
+db:
+  path: /data/diun.db
+
+watch:
+  workers: 10
+  schedule: "0 2 * * *"
+  jitter: 30s
+  
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    watchByDefault: false
+    watchStopped: false
+    watchPaused: false
+    pruneImages: true
+
+notif:
+  # Console output notification (default)
+  console:
+    enabled: true
+    
+  # Optional: Configure other notification methods
+  # webhook:
+  #   endpoint: "https://your-webhook-url"
+  #   method: POST
+  #   headers:
+  #     Content-Type: application/json
+  #     
+  # slack:
+  #   webhookURL: "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
+  #
+  # email:
+  #   host: smtp.gmail.com
+  #   port: 587
+  #   ssl: false
+  #   insecureSkipVerify: false
+  #   from: your-email@gmail.com
+  #   to:
+  #     - recipient@example.com
+  #   username: your-email@gmail.com
+  #   password: your-app-password
+EOF
+
+	print_info "Created DIUN configuration file: diun-config.yml"
+	print_note "You can customize notification methods in diun-config.yml"
 }
 
 create_env_file() {
@@ -1109,12 +1175,33 @@ EOF
 create_update_script() {
 	cat >./update.sh <<EOF
 #!/bin/bash
+echo "Starting manual NocoDB update..."
 $CONFIG_DOCKER_COMMAND compose pull
-$CONFIG_DOCKER_COMMAND compose up -d --force-recreate
+$CONFIG_DOCKER_COMMAND compose up -d --remove-orphans
 $CONFIG_DOCKER_COMMAND image prune -a -f
+
+# Check for DIUN status
+if $CONFIG_DOCKER_COMMAND ps | grep -q "diun"; then
+    echo ""
+    echo "DIUN Status:"
+    echo "  - DIUN is monitoring for container updates"
+    echo "  - Check ./diun-data/diun.db for update history"
+    echo "  - View logs: $CONFIG_DOCKER_COMMAND logs diun"
+else
+    echo ""
+    echo "Note: DIUN is not running. Container updates will not be monitored."
+fi
+
+echo ""
+echo "Update complete!"
 EOF
 	chmod +x ./update.sh
 	message_arr+=("Update script: update.sh")
+	
+	if [ "${CONFIG_DIUN_ENABLED}" = "Y" ]; then
+		message_arr+=("DIUN monitoring: Enabled (checks daily at 2 AM)")
+		message_arr+=("DIUN logs: docker logs diun")
+	fi
 }
 
 start_services() {
@@ -1159,6 +1246,7 @@ management_menu() {
 		5) upgrade_service && MSG="NocoDB has been upgraded to latest version" ;;
 		6) scale_service && MSG="NocoDB has been scaled" ;;
 		7) monitoring_service ;;
+		8) check_updates && MSG="Update check complete" ;;
 		0) exit 0 ;;
 		*) MSG="\nInvalid choice. Please select a correct option." ;;
 		esac
@@ -1178,6 +1266,7 @@ show_menu() {
 	echo -e " ${BLUE}5. Upgrade"
 	echo -e " 6. Scale"
 	echo -e " 7. Monitoring"
+	echo -e " 8. Check Updates (DIUN)"
 	echo -e " ${RED}0. Exit${NC}"
 }
 
@@ -1306,6 +1395,27 @@ monitoring_service() {
 	$CONFIG_DOCKER_COMMAND stats
 }
 
+check_updates() {
+	echo -e "\nChecking for container updates with DIUN..."
+	
+	if ! $CONFIG_DOCKER_COMMAND ps | grep -q "diun"; then
+		echo "DIUN is not running. Starting DIUN..."
+		$CONFIG_DOCKER_COMMAND compose up -d diun
+		sleep 3
+	fi
+	
+	echo ""
+	echo "Recent DIUN logs:"
+	echo "=================="
+	$CONFIG_DOCKER_COMMAND logs --tail 50 diun | grep -E "(New image found|No new image)|diun"
+	
+	echo ""
+	echo "To view full DIUN logs, run: docker logs diun"
+	echo "To configure notifications, edit: ./diun-config.yml"
+	echo ""
+	read -p "Press any key to continue..."
+}
+
 main() {
 	CONFIG_DOCKER_COMMAND=$([ "$(check_for_docker_sudo)" = "y" ] && echo "sudo docker" || echo "docker")
 
@@ -1316,6 +1426,7 @@ main() {
 	create_docker_compose_file
 	add_to_hosts
 	create_env_file
+	create_diun_config
 	create_update_script
 	start_services
 	display_completion_message
